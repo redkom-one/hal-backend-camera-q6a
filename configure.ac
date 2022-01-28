@@ -1,0 +1,80 @@
+AC_PREREQ(2.52)
+
+AC_INIT([hal-backend-camera-v4l2], [0.0.1])
+AM_INIT_AUTOMAKE([-Wall -Werror foreign])
+AC_CONFIG_HEADERS([config.h:config.hin])
+AC_CONFIG_MACRO_DIR([m4])
+
+# Checks for programs.
+m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
+AC_PROG_CC
+AC_PROG_CXX
+AM_PROG_CC_C_O
+AC_C_CONST
+dnl AC_FUNC_MALLOC
+AC_FUNC_MMAP
+AC_FUNC_REALLOC
+AC_FUNC_SELECT_ARGTYPES
+AC_FUNC_STAT
+AC_FUNC_VPRINTF
+AC_HEADER_STDBOOL
+AC_HEADER_STDC
+AC_HEADER_TIME
+AC_PROG_GCC_TRADITIONAL
+AC_PROG_LIBTOOL
+
+PKG_CHECK_MODULES(GLIB, glib-2.0)
+AC_SUBST(GLIB_CFLAGS)
+AC_SUBST(GLIB_LIBS)
+
+PKG_CHECK_MODULES(TBM, libtbm)
+AC_SUBST(TBM_CFLAGS)
+AC_SUBST(TBM_LIBS)
+
+PKG_CHECK_MODULES(DLOG, dlog)
+AC_SUBST(DLOG_CFLAGS)
+AC_SUBST(DLOG_LIBS)
+
+PKG_CHECK_MODULES(HAL_API_COMMON, hal-api-common)
+AC_SUBST(HAL_API_COMMON_CFLAGS)
+
+PKG_CHECK_MODULES(HAL_API_CAMERA, hal-api-camera)
+AC_SUBST(HAL_API_CAMERA_CFLAGS)
+
+AC_ARG_ENABLE(libv4l2, AC_HELP_STRING([--enable-libv4l2], [enable libv4l2]),
+[
+  case "${enableval}" in
+    yes) HAVE_LIBV4L2=yes ;;
+    no)  HAVE_LIBV4L2=no ;;
+    *) AC_MSG_ERROR(bad value ${enableval} for --enable-libv4l2) ;;
+  esac
+],[HAVE_LIBV4L2=no])
+if test "x$HAVE_LIBV4L2" = "xyes"; then
+PKG_CHECK_MODULES(LIBV4L2, libv4l2)
+AC_SUBST(LIBV4L2_CFLAGS)
+AC_SUBST(LIBV4L2_LIBS)
+fi
+AM_CONDITIONAL([HAVE_LIBV4L2], [test "x$HAVE_LIBV4L2" = "xyes"])
+
+# Checks for header files.
+AC_HEADER_STDC
+AC_CHECK_HEADERS([fcntl.h memory.h stdlib.h string.h sys/time.h unistd.h])
+
+# Checks for typedefs, structures, and compiler characteristics.
+AC_C_CONST
+AC_TYPE_PID_T
+AC_TYPE_SIZE_T
+
+# Checks for library functions.
+AC_FUNC_ALLOCA
+AC_FUNC_FORK
+AC_FUNC_MALLOC
+AC_FUNC_MEMCMP
+AC_FUNC_SELECT_ARGTYPES
+AC_TYPE_SIGNAL
+AC_CHECK_FUNCS([memset select])
+AC_CONFIG_FILES([
+Makefile
+src/Makefile
+])
+AC_OUTPUT
