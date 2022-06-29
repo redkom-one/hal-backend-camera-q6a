@@ -1,8 +1,14 @@
+%define enable_zero_copy 0
+
+%if 0%{?enable_zero_copy}
+%define enable_libv4l2 0
+%else
 %define enable_libv4l2 1
+%endif
 
 Name:       hal-backend-camera-v4l2
 Summary:    Tizen Camera Hal using generic V4L2 interface
-Version:    0.0.1
+Version:    0.0.2
 Release:    0
 Group:      Multimedia/Libraries
 License:    Apache-2.0
@@ -27,6 +33,9 @@ Tizen Camera Hal using generic V4L2 interface.
 
 
 %build
+%if 0%{?enable_zero_copy}
+export CFLAGS+=" -DTIZEN_FEATURE_ZERO_COPY_SUPPORT"
+%endif
 ./autogen.sh
 %configure \
 %if 0%{?enable_libv4l2}

@@ -229,6 +229,8 @@ static int __camera_v4l2_reqbufs(int device_fd, int type, int memory, uint32_t c
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
+	LOGI("type[%d], memory[%d], count[%u]", type, memory, count);
+
 	memset(&v4l2_reqbuf, 0x0, sizeof(struct v4l2_requestbuffers));
 
 	v4l2_reqbuf.type = type;
@@ -249,7 +251,7 @@ static int __camera_v4l2_reqbufs(int device_fd, int type, int memory, uint32_t c
 }
 
 
-static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index)
+static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index, int dmabuf_fd)
 {
 	struct v4l2_buffer v4l2_buf;
 	struct v4l2_plane v4l2_planes[V4L2_PLANES_MAX];
@@ -266,8 +268,13 @@ static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index)
 	v4l2_buf.type = type;
 	v4l2_buf.memory = memory;
 	v4l2_buf.m.planes = v4l2_planes;
-	v4l2_buf.length = 460800;
-	v4l2_buf.bytesused = 460800;
+
+	if (dmabuf_fd > CAMERA_HAL_INITIAL_FD) {
+		if (V4L2_TYPE_IS_MULTIPLANAR(type))
+			v4l2_buf.m.planes[0].m.fd = dmabuf_fd;
+		else
+			v4l2_buf.m.fd = dmabuf_fd;
+	}
 
 	if (v4l2_ioctl(device_fd, VIDIOC_QBUF, &v4l2_buf) < 0) {
 		LOGE("qbuf failed.  [i: %d, t: %d, m: %d] errno %d",
@@ -275,13 +282,14 @@ static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index)
 		return CAMERA_ERROR_INTERNAL;
 	}
 
-	/*LOGD("QBUF done [i: %d, t: %d, m: %d]", index, type, memory);*/
+	LOGD("QBUF done [i:%d, t:%d, m:%d, fd:%d]",
+		index, type, memory, dmabuf_fd);
 
 	return CAMERA_ERROR_NONE;
 }
 
 
-static int __camera_v4l2_dqbuf(int device_fd, int type, int memory, int *index)
+static int __camera_v4l2_dqbuf(int device_fd, int type, int memory, int *index, uint32_t *bytesused)
 {
 	int ret = CAMERA_ERROR_NONE;
 	struct v4l2_buffer v4l2_buf;
@@ -311,7 +319,12 @@ static int __camera_v4l2_dqbuf(int device_fd, int type, int memory, int *index)
 		return CAMERA_ERROR_DEVICE_READ;
 	}
 
+	LOGD("DQBUF[i:%d], bytesused[%u], length[%u]",
+		v4l2_buf.index, v4l2_buf.bytesused, v4l2_buf.length);
+
 	*index = v4l2_buf.index;
+	if (bytesused)
+		*bytesused = v4l2_buf.bytesused;
 
 	/*LOGD("dqbuf index %d", *index);*/
 
@@ -595,6 +608,7 @@ static int __camera_get_device_info_list(void)
 #endif /* HAVE_LIBV4L2 */
 	glob_t glob_buf;
 	struct v4l2_capability v4l2_cap;
+	guint32 device_caps;
 	camera_device_info_list_s *device_info_list = NULL;
 
 	g_mutex_lock(&g_device_info_lock);
@@ -665,13 +679,13 @@ static int __camera_get_device_info_list(void)
 		}
 
 		if (v4l2_cap.capabilities & V4L2_CAP_DEVICE_CAPS)
-			g_device_caps = v4l2_cap.device_caps;
+			device_caps = v4l2_cap.device_caps;
 		else
-			g_device_caps = v4l2_cap.capabilities;
+			device_caps = v4l2_cap.capabilities;
 
-		if (!(g_device_caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) ||
-			(g_device_caps & (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE))) {
-			LOGW("[%s] is not a capture device 0x%x", glob_buf.gl_pathv[i], g_device_caps);
+		if (!(device_caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) ||
+			(device_caps & (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE))) {
+			LOGW("[%s] is not a capture device 0x%x", glob_buf.gl_pathv[i], device_caps);
 			v4l2_close(device_fd);
 			continue;
 		}
@@ -681,8 +695,11 @@ static int __camera_get_device_info_list(void)
 
 		v4l2_close(device_fd);
 
-		if (ret == CAMERA_ERROR_NONE)
+		if (ret == CAMERA_ERROR_NONE) {
 			device_count++;
+			g_device_caps = device_caps;
+			LOGI("device caps [0x%08x]", g_device_caps);
+		}
 	}
 
 	device_info_list->count = device_count;
@@ -706,38 +723,63 @@ static int __camera_stop_stream(hal_camera_handle *handle, uint32_t buffer_count
 {
 	int i = 0;
 	int ret = CAMERA_ERROR_NONE;
+	camera_buffer_s *buffer = NULL;
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+	camera_tbm_buffer_s *tbm_buffer = NULL;
+#endif
 
 	if (!handle) {
 		LOGE("NULL handle");
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
-	LOGD("buffer count[%d]", buffer_count);
+	LOGI("buffer count[%d]", buffer_count);
 
 	/* stream off */
 	ret = __camera_v4l2_stream(handle->device_fd, handle->buffer_type, FALSE);
 
-	LOGD("stream off : 0x%x", ret);
+	LOGI("stream off[0x%x]", ret);
 
-	/* munmap */
+	/* release buffer */
 	for (i = 0 ; i < buffer_count ; i++) {
-		if (handle->camera_buffers[i].planes[0].data != NULL) {
-			LOGW("munmap %p", handle->camera_buffers[i].planes[0].data);
+		buffer = &handle->camera_buffers[i];
 
-			v4l2_munmap(handle->camera_buffers[i].planes[0].data, handle->camera_buffers[i].planes[0].size);
+		LOGI("release buffer[%d]", i);
 
-			handle->camera_buffers[i].planes[0].data = 0;
-			handle->camera_buffers[i].planes[0].size = 0;
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+		tbm_buffer = &handle->tbm_buffers[i];
+
+		if (tbm_buffer->dmabuf_fd > CAMERA_HAL_INITIAL_FD) {
+			LOGI("  close dmabuf fd[%d]", tbm_buffer->dmabuf_fd);
+			close(tbm_buffer->dmabuf_fd);
+			tbm_buffer->dmabuf_fd = CAMERA_HAL_INITIAL_FD;
+		}
+
+		if (tbm_buffer->bo) {
+			LOGI("  unref tbm bo[%p]", tbm_buffer->bo);
+			tbm_bo_unref(tbm_buffer->bo);
+			tbm_buffer->bo = NULL;
+		}
+
+		tbm_buffer->bo_handle.ptr = NULL;
+#endif
+
+		if (buffer->planes[0].data) {
+#ifndef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+			LOGI("  munmap %p", buffer->planes[0].data);
+			v4l2_munmap(buffer->planes[0].data, buffer->planes[0].size);
+#endif
+			buffer->planes[0].data = NULL;
+			buffer->planes[0].size = 0;
 		} else {
-			LOGW("NULL data [index %d]", i);
+			LOGI("  NULL data [i:%d]", i);
 		}
 	}
 
-	/* reqbufs 0 */
 	ret = __camera_v4l2_reqbufs(handle->device_fd,
-		handle->buffer_type, V4L2_MEMORY_MMAP, 0, &buffer_count);
+		handle->buffer_type, handle->memory_type, 0, &buffer_count);
 
-	LOGD("reqbufs 0 : 0x%x", ret);
+	LOGI("reqbufs 0 [0x%x]", ret);
 
 	return ret;
 }
@@ -751,8 +793,13 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 	camera_buffer_s *buffer = NULL;
 	struct v4l2_format v4l2_fmt;
 	struct v4l2_streamparm v4l2_parm;
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+	uint32_t buffer_size = 0;
+	camera_tbm_buffer_s *tbm_buffer = NULL;
+#else
 	struct v4l2_buffer v4l2_buf;
 	struct v4l2_plane v4l2_planes[V4L2_PLANES_MAX];;
+#endif
 	guint32 fourcc = 0;
 	guint32 plane_num = 0;
 
@@ -760,6 +807,9 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 		LOGE("NULL param %p %p", handle, resolution);
 		return CAMERA_ERROR_INTERNAL;
 	}
+
+	LOGI("[%dx%d], format[%d], fps[%u]",
+		resolution->width, resolution->height, pixel_format, fps);
 
 	/* S_FMT */
 	ret = __camera_get_fourcc_plane_num(pixel_format, &fourcc, &plane_num);
@@ -790,11 +840,18 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(handle->buffer_type)) {
 		for (i = 0 ; i < v4l2_fmt.fmt.pix_mp.num_planes ; i++) {
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+			/* TODO: Is it needed to make array for each planes? */
+			buffer_size += v4l2_fmt.fmt.pix_mp.plane_fmt[i].sizeimage;
+#endif
 			LOGD("plane[%d] stride %u, sizeimage %u", i,
 				v4l2_fmt.fmt.pix_mp.plane_fmt[i].bytesperline,
 				v4l2_fmt.fmt.pix_mp.plane_fmt[i].sizeimage);
 		}
 	} else {
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+		buffer_size = v4l2_fmt.fmt.pix.sizeimage;
+#endif
 		LOGD("stride %d, sizeimage %d",
 			v4l2_fmt.fmt.pix.bytesperline,
 			v4l2_fmt.fmt.pix.sizeimage);
@@ -821,31 +878,77 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 
 	/* request buffer */
 	ret = __camera_v4l2_reqbufs(handle->device_fd,
-		handle->buffer_type, V4L2_MEMORY_MMAP, request_buffer_count, &handle->buffer_count);
+		handle->buffer_type, handle->memory_type,
+		request_buffer_count, &handle->buffer_count);
 	if (ret != CAMERA_ERROR_NONE) {
 		return ret;
 	}
 
-	LOGD("buffer count : request %d -> result %d",
+	LOGI("buffer count : request %d -> result %d",
 		request_buffer_count, handle->buffer_count);
 
-	/* query buffer, mmap and qbuf */
+	/* alloc and queue buffer */
 	for (i = 0 ; i < handle->buffer_count ; i++) {
+		buffer = &handle->camera_buffers[i];
+
+		buffer->index = i;
+		buffer->format = pixel_format;
+		buffer->resolution.width = resolution->width;
+		buffer->resolution.height = resolution->height;
+		buffer->num_planes = plane_num;
+
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+		tbm_buffer = &handle->tbm_buffers[i];
+
+		tbm_buffer->bo = tbm_bo_alloc(handle->bufmgr, (int)buffer_size, TBM_BO_DEFAULT);
+		if (!tbm_buffer->bo) {
+			LOGE("bo alloc failed[size:%u]", buffer_size);
+			ret = CAMERA_ERROR_OUT_OF_MEMORY;
+			goto _START_STREAM_FAILED;
+		}
+
+		tbm_buffer->bo_handle = tbm_bo_get_handle(tbm_buffer->bo, TBM_DEVICE_CPU);
+		if (!tbm_buffer->bo_handle.ptr) {
+			LOGE("bo[%p] get handle failed", tbm_buffer->bo);
+			ret = CAMERA_ERROR_INTERNAL;
+			goto _START_STREAM_FAILED;
+		}
+
+		tbm_buffer->dmabuf_fd = tbm_bo_export_fd(tbm_buffer->bo);
+		if (tbm_buffer->dmabuf_fd < 0) {
+			LOGE("export fd failed from bo[%p]", tbm_buffer->bo);
+			ret = CAMERA_ERROR_INTERNAL;
+			goto _START_STREAM_FAILED;
+		}
+
+		buffer->total_size = buffer_size;
+		buffer->planes[0].size = buffer_size;
+		buffer->planes[0].data = tbm_buffer->bo_handle.ptr;
+		buffer->num_bos = 1;
+		buffer->bos[0] = tbm_buffer->bo;
+
+		LOGD("buffer[%d], size[%d], data[%p], bo[%p], fd[%d]",
+			i, buffer->planes[0].size, buffer->planes[0].data,
+			tbm_buffer->bo, tbm_buffer->dmabuf_fd);
+
+		ret = __camera_v4l2_qbuf(handle->device_fd,
+			handle->buffer_type, handle->memory_type,
+			i, tbm_buffer->dmabuf_fd);
+#else /* TIZEN_FEATURE_ZERO_COPY_SUPPORT */
 		memset(&v4l2_buf, 0x0, sizeof(struct v4l2_buffer));
 		memset(v4l2_planes, 0x0, sizeof(v4l2_planes));
 
 		v4l2_buf.type = handle->buffer_type;
-		v4l2_buf.memory = V4L2_MEMORY_MMAP;
+		v4l2_buf.memory = handle->memory_type;
 		v4l2_buf.index = i;
 		v4l2_buf.m.planes = v4l2_planes;
 		v4l2_buf.length = plane_num;
 
 		if (v4l2_ioctl(handle->device_fd, VIDIOC_QUERYBUF, &v4l2_buf) < 0) {
 			LOGE("[%d] query buf failed. errno %d", i, errno);
+			ret = CAMERA_ERROR_INTERNAL;
 			goto _START_STREAM_FAILED;
 		}
-
-		buffer = &handle->camera_buffers[i];
 
 		buffer->index = i;
 		buffer->format = pixel_format;
@@ -866,7 +969,15 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 			goto _START_STREAM_FAILED;
 		}
 
-		if (__camera_v4l2_qbuf(handle->device_fd, handle->buffer_type, V4L2_MEMORY_MMAP, i) != CAMERA_ERROR_NONE) {
+		LOGI("buffer[%d], size[%d], data[%p]",
+			i, buffer->planes[0].size, buffer->planes[0].data);
+
+		ret = __camera_v4l2_qbuf(handle->device_fd,
+			handle->buffer_type, handle->memory_type,
+			i, CAMERA_HAL_INITIAL_FD);
+#endif /* TIZEN_FEATURE_ZERO_COPY_SUPPORT */
+
+		if (ret != CAMERA_ERROR_NONE) {
 			LOGE("[%d] qbuf failed (errno %d)", i, errno);
 			goto _START_STREAM_FAILED;
 		}
@@ -879,6 +990,8 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 		goto _START_STREAM_FAILED;
 	}
 
+	LOGI("done");
+
 	return CAMERA_ERROR_NONE;
 
 _START_STREAM_FAILED:
@@ -890,10 +1003,11 @@ _START_STREAM_FAILED:
 static void __camera_do_capture(hal_camera_handle *handle)
 {
 	int ret = CAMERA_ERROR_NONE;
-	int buffer_index = 0;
+	int index = 0;
 	gint64 current_time = 0;
 	gint64 previous_time = 0;
 	gint64 interval_us = 0;
+	uint32_t bytesused = 0;
 
 	if (!handle) {
 		LOGE("NULL handle");
@@ -933,11 +1047,14 @@ static void __camera_do_capture(hal_camera_handle *handle)
 		}
 
 		ret = __camera_v4l2_dqbuf(handle->device_fd,
-			handle->buffer_type, V4L2_MEMORY_MMAP, &buffer_index);
+			handle->buffer_type, handle->memory_type,
+			&index, &bytesused);
 		if (ret != CAMERA_ERROR_NONE) {
 			LOGE("dqbuf failed for capture[0x%x]", ret);
 			goto _CAPTURE_DONE;
 		}
+
+		handle->camera_buffers[index].planes[0].bytesused = bytesused;
 
 		if (handle->captured_count > 0) {
 			g_mutex_lock(&handle->buffer_lock);
@@ -965,10 +1082,10 @@ static void __camera_do_capture(hal_camera_handle *handle)
 		g_mutex_unlock(&handle->buffer_lock);
 
 		LOGD("capture cb[%p], buffer index[%d],count[%d]",
-			handle->capture_cb, buffer_index, handle->captured_count);
+			handle->capture_cb, index, handle->captured_count);
 
 		if (handle->capture_cb) {
-			handle->capture_cb(&handle->camera_buffers[buffer_index],
+			handle->capture_cb(&handle->camera_buffers[index],
 				NULL, NULL, handle->capture_cb_data);
 		} else {
 			LOGW("capture callback is NULL");
@@ -979,7 +1096,8 @@ static void __camera_do_capture(hal_camera_handle *handle)
 
 _TRY_NEXT:
 		ret = __camera_v4l2_qbuf(handle->device_fd,
-			handle->buffer_type, V4L2_MEMORY_MMAP, buffer_index);
+			handle->buffer_type, handle->memory_type,
+			index, handle->tbm_buffers[index].dmabuf_fd);
 		if (ret != CAMERA_ERROR_NONE)
 			LOGE("qbuf failed for capture[0x%x]", ret);
 	} while (handle->captured_count < handle->capture_count);
@@ -1021,6 +1139,7 @@ static void *__camera_buffer_handler_func(gpointer data)
 	int error = CAMERA_ERROR_NONE;
 	int index = 0;
 	hal_camera_handle *handle = (hal_camera_handle *)data;
+	uint32_t bytesused = 0;
 
 	if (!handle) {
 		LOGE("NULL handle for buffer handler");
@@ -1048,13 +1167,16 @@ static void *__camera_buffer_handler_func(gpointer data)
 			break;
 		}
 
-		error = __camera_v4l2_dqbuf(handle->device_fd, handle->buffer_type, V4L2_MEMORY_MMAP, &index);
+		error = __camera_v4l2_dqbuf(handle->device_fd,
+			handle->buffer_type, handle->memory_type,
+			&index, &bytesused);
 		if (error != CAMERA_ERROR_NONE) {
 			LOGE("dqbuf failed[0x%x]", error);
 			break;
 		}
 
 		handle->buffer_dequeued_count++;
+		handle->camera_buffers[index].planes[0].bytesused = bytesused;
 
 		/*LOGD("dequeued buffer count %d", handle->buffer_dequeued_count);*/
 
@@ -1212,6 +1334,7 @@ static void __camera_release_handle(hal_camera_handle *handle)
 
 int camera_v4l2_init(void **camera_handle)
 {
+	int i = 0;
 	int ret = CAMERA_ERROR_NONE;
 	hal_camera_handle *new_handle = NULL;
 	tbm_bufmgr bufmgr = NULL;
@@ -1221,6 +1344,12 @@ int camera_v4l2_init(void **camera_handle)
 	if (!camera_handle) {
 		LOGE("NULL pointer for handle");
 		return CAMERA_ERROR_INVALID_PARAMETER;
+	}
+
+	ret = __camera_get_device_info_list();
+	if (ret != CAMERA_ERROR_NONE) {
+		LOGE("get device info failed[0x%x]", ret);
+		return ret;
 	}
 
 	bufmgr = tbm_bufmgr_init(-1);
@@ -1260,11 +1389,8 @@ int camera_v4l2_init(void **camera_handle)
 	new_handle->device_fd = CAMERA_HAL_INITIAL_FD;
 	new_handle->state = CAMERA_STATE_INITIALIZED;
 
-	ret = __camera_get_device_info_list();
-	if (ret != CAMERA_ERROR_NONE) {
-		LOGE("get device info failed");
-		goto _INIT_ERROR;
-	}
+	for (i = 0 ; i < BUFFER_MAX ; i++)
+		new_handle->tbm_buffers[i].dmabuf_fd = CAMERA_HAL_INITIAL_FD;
 
 #ifdef HAVE_LIBV4L2
 	LOGI("libv4l2 ENABLED");
@@ -1393,9 +1519,15 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 	}
 
 	if (g_device_caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
-		handle->buffer_type = V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+		handle->buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	else
-		handle->buffer_type = V4L2_CAP_VIDEO_CAPTURE;
+		handle->buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+#ifdef TIZEN_FEATURE_ZERO_COPY_SUPPORT
+	handle->memory_type = V4L2_MEMORY_DMABUF;
+#else
+	handle->memory_type = V4L2_MEMORY_MMAP;
+#endif
 
 #ifdef HAVE_LIBV4L2
 	libv4l2_fd = v4l2_fd_open(device_fd, V4L2_ENABLE_ENUM_FMT_EMULATION);
@@ -1745,7 +1877,7 @@ int camera_v4l2_start_preview(void *camera_handle, hal_camera_preview_frame_cb c
 }
 
 
-int camera_v4l2_release_preview_buffer(void *camera_handle, int buffer_index)
+int camera_v4l2_release_preview_buffer(void *camera_handle, int index)
 {
 	int ret = CAMERA_ERROR_NONE;
 	hal_camera_handle *handle = (hal_camera_handle *)camera_handle;
@@ -1755,13 +1887,14 @@ int camera_v4l2_release_preview_buffer(void *camera_handle, int buffer_index)
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
-	if (buffer_index >= handle->buffer_count) {
-		LOGE("invalid buffer index %d", buffer_index);
+	if (index >= handle->buffer_count) {
+		LOGE("invalid buffer index %d", index);
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
 	ret = __camera_v4l2_qbuf(handle->device_fd,
-		handle->buffer_type, V4L2_MEMORY_MMAP, buffer_index);
+		handle->buffer_type, handle->memory_type,
+		index, handle->tbm_buffers[index].dmabuf_fd);
 
 	g_mutex_lock(&handle->buffer_lock);
 
@@ -1772,9 +1905,9 @@ int camera_v4l2_release_preview_buffer(void *camera_handle, int buffer_index)
 			LOGW("invalid dequeued buffer count[%u]", handle->buffer_dequeued_count);
 
 		/*LOGD("qbud done : index %d, dequeued buffer count %d",
-			buffer_index, handle->buffer_dequeued_count);*/
+			index, handle->buffer_dequeued_count);*/
 	} else {
-		LOGE("qbuf failed [index %d]", buffer_index);
+		LOGE("qbuf failed [index %d]", index);
 	}
 
 	g_cond_signal(&handle->buffer_cond);
@@ -1823,11 +1956,13 @@ int camera_v4l2_stop_preview(void *camera_handle)
 
 	g_mutex_unlock(&handle->buffer_lock);
 
-	ret = __camera_stop_stream(handle, handle->buffer_count);
-
 	/* wait for preview thread exit */
+	LOGD("wait for buffer thread");
+
 	g_thread_join(handle->buffer_thread);
 	handle->buffer_thread = NULL;
+
+	ret = __camera_stop_stream(handle, handle->buffer_count);
 
 	handle->state = CAMERA_STATE_OPENED;
 
@@ -1985,7 +2120,7 @@ int camera_v4l2_start_record(void *camera_handle, hal_camera_video_frame_cb call
 }
 
 
-int camera_v4l2_release_video_buffer(void *camera_handle, int buffer_index)
+int camera_v4l2_release_video_buffer(void *camera_handle, int index)
 {
 	if (!camera_handle) {
 		LOGE("NULL handle");
@@ -2057,7 +2192,7 @@ int camera_v4l2_unset_extra_preview_frame_cb(void *camera_handle)
 }
 
 
-int camera_v4l2_release_extra_preview_buffer(void *camera_handle, int stream_id, int buffer_index)
+int camera_v4l2_release_extra_preview_buffer(void *camera_handle, int stream_id, int index)
 {
 	hal_camera_handle *handle = (hal_camera_handle *)camera_handle;
 
@@ -2066,7 +2201,7 @@ int camera_v4l2_release_extra_preview_buffer(void *camera_handle, int stream_id,
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
-	LOGI("done - stream_id[%d], index[%d]", stream_id, buffer_index);
+	LOGI("done - stream_id[%d], index[%d]", stream_id, index);
 
 	return CAMERA_ERROR_NONE;
 }

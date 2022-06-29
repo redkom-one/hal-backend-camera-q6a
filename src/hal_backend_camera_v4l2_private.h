@@ -50,6 +50,12 @@ typedef struct _set_batch_table_s {
 	void *value;
 } set_batch_table_s;
 
+typedef struct _camera_tbm_buffer_s {
+	tbm_bo bo;
+	tbm_bo_handle bo_handle;
+	int dmabuf_fd;
+} camera_tbm_buffer_s;
+
 typedef struct _camera_hal_handle {
 	/* tbm */
 	tbm_bufmgr bufmgr;
@@ -64,7 +70,9 @@ typedef struct _camera_hal_handle {
 	gboolean buffer_thread_run;
 	guint32 buffer_count;
 	camera_buffer_s camera_buffers[BUFFER_MAX];
+	camera_tbm_buffer_s tbm_buffers[BUFFER_MAX];
 	enum v4l2_buf_type buffer_type;
+	enum v4l2_memory memory_type;
 	GMutex buffer_lock;
 	GCond buffer_cond;
 
