@@ -2363,7 +2363,7 @@ static int __set_command(hal_camera_handle *handle, int64_t command, void *value
 		return CAMERA_ERROR_INVALID_STATE;
 	}
 
-	LOGD("set command %"PRIx64" - state %d", command, handle->state);
+	LOGI("command[%"PRIx64"] -> [%d]", command, set_value);
 
 	switch (command) {
 	case CAMERA_COMMAND_BRIGHTNESS:
@@ -2390,6 +2390,9 @@ static int __set_command(hal_camera_handle *handle, int64_t command, void *value
 	case CAMERA_COMMAND_TILT:
 		cid = V4L2_CID_TILT_ABSOLUTE;
 		break;
+	case CAMERA_COMMAND_EXPOSURE:
+		cid = V4L2_CID_EXPOSURE;
+		break;
 	case CAMERA_COMMAND_FLIP:
 		if (set_value != CAMERA_FLIP_NONE) {
 			LOGE("NOT_SUPPORTED flip %d", set_value);
@@ -2398,22 +2401,17 @@ static int __set_command(hal_camera_handle *handle, int64_t command, void *value
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_CAPTURE_COUNT:
 		handle->capture_count = set_value;
-		LOGI("capture count %u", handle->capture_count);
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_CAPTURE_INTERVAL:
 		handle->capture_interval_ms = set_value;
-		LOGI("capture interval %u ms", handle->capture_interval_ms);
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_FOCUS_MODE:
-		LOGI("set focus mode [old:%d -> new:%d]", handle->focus_mode, set_value);
 		handle->focus_mode = set_value;
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_FOCUS_RANGE:
-		LOGI("set focus range [old:%d -> new:%d]", handle->focus_range, set_value);
 		handle->focus_range = set_value;
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_FOCUS_LEVEL:
-		LOGI("set focus level [old:%d -> new:%d]", handle->focus_level, set_value);
 		handle->focus_level = set_value;
 		return CAMERA_ERROR_NONE;
 	default:
@@ -2476,7 +2474,7 @@ int camera_v4l2_get_command(void *camera_handle, int64_t command, void **value)
 
 	g_mutex_lock(&handle->lock);
 
-	LOGD("get command %"PRIx64" - state %d", command, handle->state);
+	LOGI("command[%"PRIx64"]", command);
 
 	switch (command) {
 	case CAMERA_COMMAND_BRIGHTNESS:
@@ -2491,20 +2489,20 @@ int camera_v4l2_get_command(void *camera_handle, int64_t command, void **value)
 	case CAMERA_COMMAND_SHARPNESS:
 		cid = V4L2_CID_SHARPNESS;
 		break;
+	case CAMERA_COMMAND_EXPOSURE:
+		cid = V4L2_CID_EXPOSURE;
+		break;
 	case CAMERA_COMMAND_FOCUS_MODE:
 		**(int **)value = handle->focus_mode;
-		LOGI("get focus mode %d", **(int **)value);
 		goto _GET_COMMAND_DONE;
 	case CAMERA_COMMAND_FOCUS_RANGE:
 		**(int **)value = handle->focus_range;
-		LOGI("get focus range %d", **(int **)value);
 		goto _GET_COMMAND_DONE;
 	case CAMERA_COMMAND_FOCUS_LEVEL:
 		**(int **)value = handle->focus_level;
-		LOGI("get focus level %d", **(int **)value);
 		goto _GET_COMMAND_DONE;
 	default:
-		LOGE("NOT_SUPPORTED %"PRIx64, command);
+		LOGE("Not supported command[%"PRIx64"]", command);
 		g_mutex_unlock(&handle->lock);
 		return CAMERA_ERROR_DEVICE_NOT_SUPPORTED;
 	}
@@ -2537,6 +2535,9 @@ int camera_v4l2_get_command(void *camera_handle, int64_t command, void **value)
 	}
 
 _GET_COMMAND_DONE:
+	if (ret == CAMERA_ERROR_NONE)
+		LOGI("get[%d]", **(int **)value);
+
 	g_mutex_unlock(&handle->lock);
 
 	return ret;
