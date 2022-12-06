@@ -34,12 +34,16 @@
 #include <dlog.h>
 #include <sched.h>
 #include "hal_backend_camera_v4l2_private.h"
+#include <tbm_surface.h>
 
 #ifdef LOG_TAG
 #undef LOG_TAG
 #endif /* LOG_TAG */
 #define LOG_TAG "CAMERA_HAL"
 
+#define ENV_VIRTUAL_CAMERA      "VIRTUAL_CAMERA"
+#define VIRTUAL_CAMERA_FMT_MAX  2
+#define VIRTUAL_CAMERA_RES_MAX  3
 #define TEST_JPEG_PATH          "/home/owner/media/Images/test.jpg"
 #define DEVICE_NODE_PATH_MAX    16
 #define DEVICE_NODE_PATH_PREFIX "/dev/video"
@@ -51,9 +55,21 @@
 	(fourcc >> 24) & 0xff
 
 
+static gboolean g_is_virtual_camera_mode;
+static uint32_t g_virtual_camera_bytesused;
+static gulong g_virtual_camera_frame_delay;
 static camera_device_info_list_s *g_device_info_list;
 static guint32 g_device_caps;
 static GMutex g_device_info_lock;
+static uint32_t g_virtual_camera_format[VIRTUAL_CAMERA_FMT_MAX] = {
+	V4L2_PIX_FMT_YUV420,
+	V4L2_PIX_FMT_NV12
+};
+static camera_resolution_s g_virtual_camera_res[VIRTUAL_CAMERA_RES_MAX] = {
+	{640, 480},
+	{1280, 720},
+	{1920, 1080}
+};
 
 
 static void __camera_hal_v4l2_destructor(void) __attribute__((destructor));
@@ -119,6 +135,11 @@ static int __camera_v4l2_wait_frame(int device_fd, int wait_time)
 	fd_set fds;
 	struct timeval timeout;
 
+	if (g_is_virtual_camera_mode) {
+		g_usleep(g_virtual_camera_frame_delay);
+		return CAMERA_ERROR_NONE;
+	}
+
 	if (device_fd < 0) {
 		LOGE("invalid fd %d", device_fd);
 		return CAMERA_ERROR_INVALID_PARAMETER;
@@ -169,9 +190,11 @@ static int __camera_v4l2_g_ctrl(int device_fd, int cid, int *value)
 
 	ctrl.id = cid;
 
-	ret = v4l2_ioctl(device_fd, VIDIOC_G_CTRL, &ctrl);
+	if (!g_is_virtual_camera_mode)
+		ret = v4l2_ioctl(device_fd, VIDIOC_G_CTRL, &ctrl);
 
-	*value = ctrl.value;
+	if (ret == 0)
+		*value = ctrl.value;
 
 	LOGD("G_CTRL id 0x%x, value %d, ret %d", cid, *value, ret);
 
@@ -189,7 +212,8 @@ static int __camera_v4l2_s_ctrl(int device_fd, int cid, int value)
 	ctrl.id = cid;
 	ctrl.value = value;
 
-	ret = v4l2_ioctl(device_fd, VIDIOC_S_CTRL, &ctrl);
+	if (!g_is_virtual_camera_mode)
+		ret = v4l2_ioctl(device_fd, VIDIOC_S_CTRL, &ctrl);
 
 	LOGD("S_CTRL id 0x%x, value %d, ret %d", cid, value, ret);
 
@@ -204,9 +228,11 @@ static int __camera_v4l2_stream(int device_fd, int type, gboolean onoff)
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
-	if (v4l2_ioctl(device_fd, onoff ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &type) < 0) {
-		LOGE("stream %d failed. [t:%d] errno %d", onoff, type, errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(device_fd, onoff ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &type) < 0) {
+			LOGE("stream %d failed. [t:%d] errno %d", onoff, type, errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
 	}
 
 	LOGD("stream %d done [t:%d]", onoff, type);
@@ -237,9 +263,11 @@ static int __camera_v4l2_reqbufs(int device_fd, int type, int memory, uint32_t c
 	v4l2_reqbuf.memory = memory;
 	v4l2_reqbuf.count = count;
 
-	if (v4l2_ioctl(device_fd, VIDIOC_REQBUFS, &v4l2_reqbuf) < 0) {
-		LOGE("REQBUFS[count %d] failed. errno %d", count, errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(device_fd, VIDIOC_REQBUFS, &v4l2_reqbuf) < 0) {
+			LOGE("REQBUFS[count %d] failed. errno %d", count, errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
 	}
 
 	if (v4l2_reqbuf.count != count)
@@ -276,10 +304,12 @@ static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index, in
 			v4l2_buf.m.fd = dmabuf_fd;
 	}
 
-	if (v4l2_ioctl(device_fd, VIDIOC_QBUF, &v4l2_buf) < 0) {
-		LOGE("qbuf failed.  [i: %d, t: %d, m: %d] errno %d",
-			index, type, memory, errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(device_fd, VIDIOC_QBUF, &v4l2_buf) < 0) {
+			LOGE("qbuf failed.  [i: %d, t: %d, m: %d] errno %d",
+				index, type, memory, errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
 	}
 
 	LOGD("QBUF done [i:%d, t:%d, m:%d, fd:%d]",
@@ -292,6 +322,7 @@ static int __camera_v4l2_qbuf(int device_fd, int type, int memory, int index, in
 static int __camera_v4l2_dqbuf(int device_fd, int type, int memory, int *index, uint32_t *bytesused)
 {
 	int ret = CAMERA_ERROR_NONE;
+	static int virtual_buffer_index = 0;
 	struct v4l2_buffer v4l2_buf;
 	struct v4l2_plane v4l2_planes[V4L2_PLANES_MAX];
 
@@ -312,11 +343,19 @@ static int __camera_v4l2_dqbuf(int device_fd, int type, int memory, int *index, 
 	v4l2_buf.memory = memory;
 	v4l2_buf.m.planes = v4l2_planes;
 
-	ret = v4l2_ioctl(device_fd, VIDIOC_DQBUF, &v4l2_buf);
-	if (ret < 0) {
-		LOGE("dqbuf failed. [t: %d, m: %d] errno %d",
-			type, memory, errno);
-		return CAMERA_ERROR_DEVICE_READ;
+	if (!g_is_virtual_camera_mode) {
+		ret = v4l2_ioctl(device_fd, VIDIOC_DQBUF, &v4l2_buf);
+		if (ret < 0) {
+			LOGE("dqbuf failed. [t: %d, m: %d] errno %d",
+				type, memory, errno);
+			return CAMERA_ERROR_DEVICE_READ;
+		}
+	} else {
+		v4l2_buf.index = virtual_buffer_index++;
+		v4l2_buf.bytesused = g_virtual_camera_bytesused;
+
+		if (virtual_buffer_index >= BUFFER_MAX)
+			virtual_buffer_index = 0;
 	}
 
 	LOGD("DQBUF[i:%d], bytesused[%u], length[%u]",
@@ -448,6 +487,13 @@ static void __camera_get_fps_list(int device_fd, guint32 pixel_format, int width
 		return;
 	}
 
+	if (g_is_virtual_camera_mode) {
+		fps_list->fps[0] = 30;
+		fps_list->count = 1;
+		g_virtual_camera_frame_delay = G_USEC_PER_SEC / fps_list->fps[0];
+		return;
+	}
+
 	ival.index = 0;
 	ival.pixel_format = pixel_format;
 	ival.width = width;
@@ -497,9 +543,16 @@ static int __camera_get_device_info(int device_index, int device_fd, camera_devi
 		v4l2_format.index = format_index;
 		v4l2_format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
-		if (v4l2_ioctl(device_fd, VIDIOC_ENUM_FMT, &v4l2_format) < 0) {
-			LOGW("\tformat : end of enumeration");
-			break;
+		if (!g_is_virtual_camera_mode) {
+			if (v4l2_ioctl(device_fd, VIDIOC_ENUM_FMT, &v4l2_format) < 0) {
+				LOGW("\tformat : end of enumeration");
+				break;
+			}
+		} else {
+			if (format_count == VIRTUAL_CAMERA_FMT_MAX)
+				break;
+
+			v4l2_format.pixelformat = g_virtual_camera_format[format_count];
 		}
 
 		LOGD("\tTry [%d] format "FOURCC_FORMAT" (emulated:%d)",
@@ -523,9 +576,18 @@ static int __camera_get_device_info(int device_index, int device_fd, camera_devi
 			v4l2_frame.index = resolution_index;
 			v4l2_frame.pixel_format = v4l2_format.pixelformat;
 
-			if (v4l2_ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &v4l2_frame) < 0) {
-				LOGW("\t\tframesize : end of enumeration");
-				break;
+			if (!g_is_virtual_camera_mode) {
+				if (v4l2_ioctl(device_fd, VIDIOC_ENUM_FRAMESIZES, &v4l2_frame) < 0) {
+					LOGW("\t\tframesize : end of enumeration");
+					break;
+				}
+			} else {
+				if (resolution_count == VIRTUAL_CAMERA_RES_MAX)
+					break;
+
+				v4l2_frame.discrete.width = g_virtual_camera_res[resolution_count].width;
+				v4l2_frame.discrete.height = g_virtual_camera_res[resolution_count].height;
+				v4l2_frame.type = V4L2_FRMSIZE_TYPE_DISCRETE;
 			}
 
 			if (resolution_count + 1 >= RESOLUTION_COUNT_MAX) {
@@ -600,7 +662,7 @@ static int __camera_get_device_info(int device_index, int device_fd, camera_devi
 static int __camera_get_device_info_list(void)
 {
 	int i = 0;
-	int ret = 0;
+	int ret = CAMERA_ERROR_NONE;
 	int device_count = 0;
 	int device_fd = CAMERA_HAL_INITIAL_FD;
 #ifdef HAVE_LIBV4L2
@@ -623,6 +685,17 @@ static int __camera_get_device_info_list(void)
 	if (!device_info_list) {
 		LOGE("failed to alloc device info structure");
 		ret = CAMERA_ERROR_OUT_OF_MEMORY;
+		goto _GET_DEVICE_INFO_LIST_DONE;
+	}
+
+	if (g_is_virtual_camera_mode) {
+		device_count = 1;
+
+		ret = __camera_get_device_info(0, 0, &device_info_list->device_info[0], "VIRTUAL_CAMERA");
+
+		device_info_list->count = device_count;
+		g_device_info_list = device_info_list;
+
 		goto _GET_DEVICE_INFO_LIST_DONE;
 	}
 
@@ -833,9 +906,20 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 		v4l2_fmt.fmt.pix.bytesperline = resolution->width;
 	}
 
-	if (v4l2_ioctl(handle->device_fd, VIDIOC_S_FMT, &v4l2_fmt) < 0) {
-		LOGE("S_FMT failed. errno %d", errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(handle->device_fd, VIDIOC_S_FMT, &v4l2_fmt) < 0) {
+			LOGE("S_FMT failed. errno %d", errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
+	} else {
+		tbm_surface_h surface = NULL;
+		tbm_surface_info_s sinfo;
+
+		surface = tbm_surface_create(resolution->width, resolution->height, TBM_FORMAT_YUV420);
+		tbm_surface_get_info(surface, &sinfo);
+		tbm_surface_destroy(surface);
+
+		g_virtual_camera_bytesused = v4l2_fmt.fmt.pix.sizeimage = sinfo.size;
 	}
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(handle->buffer_type)) {
@@ -862,18 +946,22 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 
 	v4l2_parm.type = handle->buffer_type;
 
-	if (v4l2_ioctl(handle->device_fd, VIDIOC_G_PARM, &v4l2_parm) < 0) {
-		LOGE("G_PARM failed. errno %d", errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(handle->device_fd, VIDIOC_G_PARM, &v4l2_parm) < 0) {
+			LOGE("G_PARM failed. errno %d", errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
 	}
 
 	/* S_PARM to set fps */
 	v4l2_parm.parm.capture.timeperframe.numerator = 1;
 	v4l2_parm.parm.capture.timeperframe.denominator = fps;
 
-	if (v4l2_ioctl(handle->device_fd, VIDIOC_S_PARM, &v4l2_parm) < 0) {
-		LOGE("S_PARM failed. errno %d", errno);
-		return CAMERA_ERROR_INTERNAL;
+	if (!g_is_virtual_camera_mode) {
+		if (v4l2_ioctl(handle->device_fd, VIDIOC_S_PARM, &v4l2_parm) < 0) {
+			LOGE("S_PARM failed. errno %d", errno);
+			return CAMERA_ERROR_INTERNAL;
+		}
 	}
 
 	/* request buffer */
@@ -1477,22 +1565,29 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 	if (handle->state != CAMERA_STATE_INITIALIZED) {
 		LOGE("invalid state %d", handle->state);
 		ret = CAMERA_ERROR_INVALID_STATE;
-		goto _OPEN_DEVICE_DONE;
+		goto _OPEN_DEVICE_EXIT;
 	}
 
 	if (!g_device_info_list) {
 		LOGE("NO DEVICE INFO");
 		ret = CAMERA_ERROR_INTERNAL;
-		goto _OPEN_DEVICE_DONE;
+		goto _OPEN_DEVICE_EXIT;
 	}
 
 	if (device_index >= g_device_info_list->count) {
 		LOGE("invalid index %d [info:%d]", device_index, g_device_info_list->count);
 		ret = CAMERA_ERROR_INVALID_PARAMETER;
-		goto _OPEN_DEVICE_DONE;
+		goto _OPEN_DEVICE_EXIT;
 	}
 
 	node_path = g_device_info_list->device_info[device_index].node_path;
+
+	if (g_is_virtual_camera_mode) {
+		device_fd = 0;
+		handle->buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		handle->memory_type = V4L2_MEMORY_DMABUF;
+		goto _OPEN_DEVICE_DONE;
+	}
 
 	device_fd = open(node_path, O_RDWR);
 	if (device_fd < 0) {
@@ -1515,7 +1610,7 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 		LOGE("open [%s] failed 0x%x [errno %d]",
 			node_path, ret, errno);
 
-		goto _OPEN_DEVICE_DONE;
+		goto _OPEN_DEVICE_EXIT;
 	}
 
 	if (g_device_caps & V4L2_CAP_VIDEO_CAPTURE_MPLANE)
@@ -1538,6 +1633,7 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 		device_fd = libv4l2_fd;
 #endif /* HAVE_LIBV4L2 */
 
+_OPEN_DEVICE_DONE:
 	handle->state = CAMERA_STATE_OPENED;
 	handle->device_index = device_index;
 	handle->device_fd = device_fd;
@@ -1545,7 +1641,7 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 	LOGD("[%d] device[%s] opened [fd %d, type %d]",
 		device_index, node_path, device_fd, handle->buffer_type);
 
-_OPEN_DEVICE_DONE:
+_OPEN_DEVICE_EXIT:
 	g_mutex_unlock(&handle->lock);
 
 	return ret;
@@ -1576,13 +1672,14 @@ int camera_v4l2_close_device(void *camera_handle)
 		return CAMERA_ERROR_INVALID_STATE;
 	}
 
-	if (handle->device_fd >= 0) {
-		LOGD("close fd %d", handle->device_fd);
-
-		v4l2_close(handle->device_fd);
-		handle->device_fd = CAMERA_HAL_INITIAL_FD;
-	} else {
-		LOGW("invalid fd %d", handle->device_fd);
+	if (!g_is_virtual_camera_mode) {
+		if (handle->device_fd >= 0) {
+			LOGD("close fd %d", handle->device_fd);
+			v4l2_close(handle->device_fd);
+			handle->device_fd = CAMERA_HAL_INITIAL_FD;
+		} else {
+			LOGW("invalid fd %d", handle->device_fd);
+		}
 	}
 
 	handle->state = CAMERA_STATE_INITIALIZED;
@@ -2686,6 +2783,10 @@ static int camera_v4l2_backend_init(void **data)
 	funcs->get_extra_preview_gop_interval = camera_v4l2_get_extra_preview_gop_interval;
 
 	*data = (void *)funcs;
+
+	g_is_virtual_camera_mode = getenv(ENV_VIRTUAL_CAMERA) ? TRUE : FALSE;
+
+	LOGW("VIRTUAL CAMERA mode[%d]", g_is_virtual_camera_mode);
 
 	return 0;
 }
