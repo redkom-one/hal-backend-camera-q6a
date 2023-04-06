@@ -515,7 +515,6 @@ static void __camera_get_fps_list(int device_fd, guint32 pixel_format, int width
 		fps_list->fps[fps_count++] = ival.discrete.denominator;
 	}
 
-
 	fps_list->count = fps_count;
 }
 
@@ -2506,11 +2505,17 @@ static int __set_command(hal_camera_handle *handle, int64_t command, void *value
 		handle->focus_mode = set_value;
 		return CAMERA_ERROR_NONE;
 	case CAMERA_COMMAND_FOCUS_RANGE:
-		handle->focus_range = set_value;
-		return CAMERA_ERROR_NONE;
+		cid = V4L2_CID_AUTO_FOCUS_RANGE;
+		break;
 	case CAMERA_COMMAND_FOCUS_LEVEL:
-		handle->focus_level = set_value;
-		return CAMERA_ERROR_NONE;
+		cid = V4L2_CID_FOCUS_ABSOLUTE;
+		break;
+	case CAMERA_COMMAND_WHITE_BALANCE_TEMPERATURE:
+		cid = V4L2_CID_WHITE_BALANCE_TEMPERATURE;
+		break;
+	case CAMERA_COMMAND_GAIN:
+		cid = V4L2_CID_GAIN;
+		break;
 	default:
 		LOGE("NOT_SUPPORTED command %"PRIx64, command);
 		return CAMERA_ERROR_DEVICE_NOT_SUPPORTED;
@@ -2593,11 +2598,17 @@ int camera_v4l2_get_command(void *camera_handle, int64_t command, void **value)
 		**(int **)value = handle->focus_mode;
 		goto _GET_COMMAND_DONE;
 	case CAMERA_COMMAND_FOCUS_RANGE:
-		**(int **)value = handle->focus_range;
-		goto _GET_COMMAND_DONE;
+		cid = V4L2_CID_AUTO_FOCUS_RANGE;
+		break;
 	case CAMERA_COMMAND_FOCUS_LEVEL:
-		**(int **)value = handle->focus_level;
-		goto _GET_COMMAND_DONE;
+		cid = V4L2_CID_FOCUS_ABSOLUTE;
+		break;
+	case CAMERA_COMMAND_WHITE_BALANCE_TEMPERATURE:
+		cid = V4L2_CID_WHITE_BALANCE_TEMPERATURE;
+		break;
+	case CAMERA_COMMAND_GAIN:
+		cid = V4L2_CID_GAIN;
+		break;
 	default:
 		LOGE("Not supported command[%"PRIx64"]", command);
 		g_mutex_unlock(&handle->lock);

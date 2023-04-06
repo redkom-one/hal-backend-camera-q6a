@@ -104,10 +104,8 @@ typedef struct _camera_hal_handle {
 	GMutex msg_cb_lock;
 	GCond msg_cb_cond;
 
-	/* focus */
+	/* settings */
 	gint32 focus_mode;
-	gint32 focus_range;
-	gint32 focus_level;
 
 	/* etc */
 	GMutex lock;

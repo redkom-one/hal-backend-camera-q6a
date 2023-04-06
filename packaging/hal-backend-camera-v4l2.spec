@@ -8,7 +8,7 @@
 
 Name:       hal-backend-camera-v4l2
 Summary:    Tizen Camera Hal using generic V4L2 interface
-Version:    0.0.4
+Version:    0.0.5
 Release:    0
 Group:      Multimedia/Libraries
 License:    Apache-2.0
