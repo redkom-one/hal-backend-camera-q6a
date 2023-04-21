@@ -1369,7 +1369,6 @@ static void *_camera_message_handler_func(gpointer data)
 		}
 
 		g_free(message);
-		message = NULL;
 
 		g_mutex_lock(&handle->msg_cb_lock);
 	}
