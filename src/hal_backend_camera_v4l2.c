@@ -1463,7 +1463,7 @@ int camera_v4l2_init(void **camera_handle)
 	/* message thread */
 	new_handle->msg_list = g_queue_new();
 	new_handle->msg_cb_run = TRUE;
-	new_handle->msg_thread = g_thread_try_new("camera_hal_msg_thread",
+	new_handle->msg_thread = g_thread_try_new("camhal:msg",
 		_camera_message_handler_func, (gpointer)new_handle, NULL);
 	if (!new_handle->msg_thread) {
 		LOGE("failed to create message thread");
@@ -1944,7 +1944,7 @@ int camera_v4l2_start_preview(void *camera_handle, hal_camera_preview_frame_cb c
 
 	handle->buffer_thread_run = TRUE;
 
-	handle->buffer_thread = g_thread_try_new("camera_hal_buffer_thread",
+	handle->buffer_thread = g_thread_try_new("camhal:buffer",
 		__camera_buffer_handler_func, (gpointer)handle, NULL);
 	if (!handle->buffer_thread) {
 		LOGE("failed to create buffer handler thread");
