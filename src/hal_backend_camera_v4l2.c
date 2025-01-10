@@ -2515,6 +2515,9 @@ static int __set_command(hal_camera_handle *handle, int64_t command, void *value
 	case CAMERA_COMMAND_GAIN:
 		cid = V4L2_CID_GAIN;
 		break;
+	case CAMERA_COMMAND_SWITCH_DEVICE:
+		LOGI("switch device to [%d]", set_value);
+		return CAMERA_ERROR_NONE;
 	default:
 		LOGE("NOT_SUPPORTED command %"PRIx64, command);
 		return CAMERA_ERROR_DEVICE_NOT_SUPPORTED;
