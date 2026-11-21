@@ -154,7 +154,7 @@ static int __open_entity_node(const struct media_entity_desc *e)
 	FILE *fp;
 	int fd;
 
-	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/uevent", e->dev.major, e->dev.minor);
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/uevent", e->v4l.major, e->v4l.minor);
 
 	fp = fopen(path, "r");
 	if (!fp) {
