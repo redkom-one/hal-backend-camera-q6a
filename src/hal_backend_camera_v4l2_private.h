@@ -25,6 +25,7 @@
 #include <tbm_bufmgr.h>
 #include <hal/hal-common-interface.h>
 #include <hal/hal-camera-interface.h>
+#include "camss.h"
 
 #ifdef HAVE_LIBV4L2
 #include <libv4l2.h>
@@ -108,6 +109,10 @@ typedef struct _camera_hal_handle {
 	gint32 focus_mode;
 	gint32 focus_range;
 	gint32 focus_level;
+
+	/* camss raw sensor (Radxa Dragon Q6A): frames are converted on the CPU */
+	camss_ctx *camss;
+	gboolean camss_busy[BUFFER_MAX];
 
 	/* etc */
 	GMutex lock;

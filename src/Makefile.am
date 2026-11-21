@@ -2,9 +2,9 @@ ACLOCAL_AMFLAGS='-I m4'
 
 lib_LTLIBRARIES = libhal-backend-camera.la
 
-noinst_HEADERS = hal_backend_camera_v4l2_private.h
+noinst_HEADERS = hal_backend_camera_v4l2_private.h camss.h
 
-libhal_backend_camera_la_SOURCES = hal_backend_camera_v4l2.c
+libhal_backend_camera_la_SOURCES = hal_backend_camera_v4l2.c camss.c
 
 libhal_backend_camera_la_CFLAGS = \
 	-I$(srcdir)/include \
@@ -17,7 +17,8 @@ libhal_backend_camera_la_CFLAGS = \
 libhal_backend_camera_la_LIBADD = \
 	$(GLIB_LIBS) \
 	$(DLOG_LIBS) \
-	$(TBM_LIBS)
+	$(TBM_LIBS) \
+	-lm
 
 if HAVE_LIBV4L2
 libhal_backend_camera_la_CFLAGS += $(LIBV4L2_CFLAGS) -DHAVE_LIBV4L2

@@ -53,6 +53,7 @@
 
 static camera_device_info_list_s *g_device_info_list;
 static guint32 g_device_caps;
+static int g_camss_index = CAMERA_HAL_INITIAL_INDEX;
 static GMutex g_device_info_lock;
 
 
@@ -626,10 +627,23 @@ static int __camera_get_device_info_list(void)
 		goto _GET_DEVICE_INFO_LIST_DONE;
 	}
 
+	/* raw Bayer sensor behind Qualcomm camss: one virtual camera, converted on the CPU */
+	if (camss_detect()) {
+		camss_fill_device_info(&device_info_list->device_info[device_count], device_count);
+		g_camss_index = device_count;
+		device_count++;
+		LOGI("camss camera added as device %d", g_camss_index);
+	}
+
 	memset(&glob_buf, 0x0, sizeof(glob_t));
 
 	ret = glob(DEVICE_NODE_PATH_PREFIX"*", 0, 0, &glob_buf);
-	if (ret != 0) {
+	if (ret != 0 && device_count > 0) {
+		LOGW("no other video node [glob %d]", ret);
+		globfree(&glob_buf);
+		memset(&glob_buf, 0x0, sizeof(glob_t));
+		ret = CAMERA_ERROR_NONE;
+	} else if (ret != 0) {
 		switch (ret) {
 		case GLOB_NOSPACE:
 			LOGE("out of memory");
@@ -683,6 +697,18 @@ static int __camera_get_device_info_list(void)
 		else
 			device_caps = v4l2_cap.capabilities;
 
+		/* camss nodes carry raw Bayer only; they are served by the camss camera above */
+		if (strncmp((const char *)v4l2_cap.driver, "qcom-camss", sizeof(v4l2_cap.driver)) == 0) {
+			v4l2_close(device_fd);
+			continue;
+		}
+
+		if (device_count >= DEVICE_COUNT_MAX) {
+			LOGW("device list is full, skip [%s]", glob_buf.gl_pathv[i]);
+			v4l2_close(device_fd);
+			continue;
+		}
+
 		if (!(device_caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) ||
 			(device_caps & (V4L2_CAP_VIDEO_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_MPLANE))) {
 			LOGW("[%s] is not a capture device 0x%x", glob_buf.gl_pathv[i], device_caps);
@@ -719,6 +745,208 @@ _GET_DEVICE_INFO_LIST_DONE:
 }
 
 
+/* ---- camss raw sensor: HAL-owned output buffers filled by CPU conversion ---- */
+
+static void __camss_free_buffers(hal_camera_handle *handle)
+{
+	int i = 0;
+
+	for (i = 0 ; i < BUFFER_MAX ; i++) {
+		g_free(handle->camera_buffers[i].planes[0].data);
+		memset(&handle->camera_buffers[i], 0x0, sizeof(camera_buffer_s));
+		handle->camss_busy[i] = FALSE;
+	}
+
+	handle->buffer_count = 0;
+}
+
+
+static int __camss_start_stream(hal_camera_handle *handle, camera_pixel_format_e pixel_format,
+	camera_resolution_s *resolution, uint32_t fps)
+{
+	int i = 0;
+	int ret = CAMERA_ERROR_NONE;
+	uint32_t size = camss_frame_size(pixel_format, resolution->width, resolution->height);
+	camera_buffer_s *buffer = NULL;
+
+	LOGI("camss [%dx%d], format[%d], fps[%u], size[%u]",
+		resolution->width, resolution->height, pixel_format, fps, size);
+
+	if (size == 0) {
+		LOGE("unsupported format %d", pixel_format);
+		return CAMERA_ERROR_INVALID_PARAMETER;
+	}
+
+	for (i = 0 ; i < BUFFER_MAX ; i++) {
+		buffer = &handle->camera_buffers[i];
+
+		memset(buffer, 0x0, sizeof(camera_buffer_s));
+		buffer->index = i;
+		buffer->format = pixel_format;
+		buffer->resolution = *resolution;
+		buffer->total_size = size;
+		buffer->num_planes = 1;
+		buffer->planes[0].data = g_malloc0(size);
+		buffer->planes[0].size = size;
+		buffer->planes[0].align_width = resolution->width;
+		buffer->planes[0].align_height = resolution->height;
+		handle->camss_busy[i] = FALSE;
+	}
+
+	handle->buffer_count = BUFFER_MAX;
+	handle->buffer_dequeued_count = 0;
+
+	ret = camss_start(handle->camss, fps);
+	if (ret != CAMERA_ERROR_NONE) {
+		LOGE("camss start failed[0x%x]", ret);
+		__camss_free_buffers(handle);
+	}
+
+	return ret;
+}
+
+
+static int __camss_stop_stream(hal_camera_handle *handle)
+{
+	int ret = camss_stop(handle->camss);
+
+	__camss_free_buffers(handle);
+
+	return ret;
+}
+
+
+/* Fill a free output buffer from the next raw frame; *index is -1 when the frame was dropped. */
+static int __camss_dequeue(hal_camera_handle *handle, int *index)
+{
+	int i = 0;
+	int ret = CAMERA_ERROR_NONE;
+
+	*index = -1;
+
+	for (i = 0 ; i < handle->buffer_count ; i++) {
+		if (!handle->camss_busy[i]) {
+			*index = i;
+			break;
+		}
+	}
+
+	if (*index < 0) {
+		LOGW("no free output buffer, drop frame");
+		return camss_get_frame(handle->camss, NULL);
+	}
+
+	ret = camss_get_frame(handle->camss, &handle->camera_buffers[*index]);
+	if (ret == CAMERA_ERROR_NONE)
+		handle->camss_busy[*index] = TRUE;
+	else
+		*index = -1;
+
+	return ret;
+}
+
+
+static void __camss_do_capture(hal_camera_handle *handle)
+{
+	int ret = CAMERA_ERROR_NONE;
+	uint32_t size = 0;
+	gint64 current_time = 0;
+	gint64 previous_time = 0;
+	gint64 interval_us = 0;
+	camera_buffer_s capture;
+
+	memset(&capture, 0x0, sizeof(camera_buffer_s));
+
+	capture.format = handle->preview_format.capture_format;
+	capture.resolution = handle->preview_format.capture_resolution;
+
+	size = camss_frame_size(capture.format, capture.resolution.width, capture.resolution.height);
+	if (size == 0) {
+		LOGW("capture format %d not supported, use preview format %d",
+			capture.format, handle->preview_format.stream_format);
+		capture.format = handle->preview_format.stream_format;
+		size = camss_frame_size(capture.format, capture.resolution.width, capture.resolution.height);
+	}
+
+	if (size == 0) {
+		LOGE("no usable capture format");
+		goto _CAPTURE_DONE;
+	}
+
+	capture.total_size = size;
+	capture.num_planes = 1;
+	capture.planes[0].data = g_malloc0(size);
+	capture.planes[0].size = size;
+	capture.planes[0].align_width = capture.resolution.width;
+	capture.planes[0].align_height = capture.resolution.height;
+
+	LOGD("camss capture [%d:%dx%d] count %u", capture.format,
+		capture.resolution.width, capture.resolution.height, handle->capture_count);
+
+	if (handle->capture_count > 1)
+		interval_us = (gint64)handle->capture_interval_ms * 1000;
+
+	do {
+		ret = __camera_v4l2_wait_frame(handle->device_fd, 5);
+		if (ret != CAMERA_ERROR_NONE) {
+			LOGE("frame wait failed for capture[0x%x]", ret);
+			goto _CAPTURE_DONE;
+		}
+
+		ret = camss_get_frame(handle->camss, &capture);
+		if (ret != CAMERA_ERROR_NONE) {
+			LOGE("camss frame failed for capture[0x%x]", ret);
+			goto _CAPTURE_DONE;
+		}
+
+		if (handle->captured_count > 0) {
+			g_mutex_lock(&handle->buffer_lock);
+			if (handle->state != CAMERA_STATE_CAPTURING) {
+				LOGW("stop continuous capture");
+				handle->captured_count = handle->capture_count;
+				g_mutex_unlock(&handle->buffer_lock);
+				continue;
+			}
+			g_mutex_unlock(&handle->buffer_lock);
+		}
+
+		if (handle->capture_count > 1) {
+			current_time = g_get_monotonic_time();
+			if (current_time < previous_time + interval_us)
+				continue;
+		}
+
+		g_mutex_lock(&handle->buffer_lock);
+		handle->captured_count++;
+		g_mutex_unlock(&handle->buffer_lock);
+
+		if (handle->capture_cb)
+			handle->capture_cb(&capture, NULL, NULL, handle->capture_cb_data);
+		else
+			LOGW("capture callback is NULL");
+
+		previous_time = current_time;
+	} while (handle->captured_count < handle->capture_count);
+
+	g_mutex_lock(&handle->buffer_lock);
+
+	if (handle->state == CAMERA_STATE_CAPTURING) {
+		LOGD("wait for capture stop signal");
+		g_cond_wait(&handle->buffer_cond, &handle->buffer_lock);
+		LOGD("signal received");
+	} else {
+		LOGD("The state is already changed.");
+	}
+
+	g_mutex_unlock(&handle->buffer_lock);
+
+_CAPTURE_DONE:
+	g_free(capture.planes[0].data);
+
+	LOGD("done");
+}
+
+
 static int __camera_stop_stream(hal_camera_handle *handle, uint32_t buffer_count)
 {
 	int i = 0;
@@ -732,6 +960,9 @@ static int __camera_stop_stream(hal_camera_handle *handle, uint32_t buffer_count
 		LOGE("NULL handle");
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
+
+	if (handle->camss)
+		return __camss_stop_stream(handle);
 
 	LOGI("buffer count[%d]", buffer_count);
 
@@ -807,6 +1038,9 @@ static int __camera_start_stream(hal_camera_handle *handle, camera_pixel_format_
 		LOGE("NULL param %p %p", handle, resolution);
 		return CAMERA_ERROR_INTERNAL;
 	}
+
+	if (handle->camss)
+		return __camss_start_stream(handle, pixel_format, resolution, fps);
 
 	LOGI("[%dx%d], format[%d], fps[%u]",
 		resolution->width, resolution->height, pixel_format, fps);
@@ -1167,12 +1401,25 @@ static void *__camera_buffer_handler_func(gpointer data)
 			break;
 		}
 
-		error = __camera_v4l2_dqbuf(handle->device_fd,
-			handle->buffer_type, handle->memory_type,
-			&index, &bytesused);
-		if (error != CAMERA_ERROR_NONE) {
-			LOGE("dqbuf failed[0x%x]", error);
-			break;
+		if (handle->camss) {
+			error = __camss_dequeue(handle, &index);
+			if (error != CAMERA_ERROR_NONE) {
+				LOGE("camss frame failed[0x%x]", error);
+				break;
+			}
+
+			if (index < 0)
+				continue;
+
+			bytesused = handle->camera_buffers[index].planes[0].bytesused;
+		} else {
+			error = __camera_v4l2_dqbuf(handle->device_fd,
+				handle->buffer_type, handle->memory_type,
+				&index, &bytesused);
+			if (error != CAMERA_ERROR_NONE) {
+				LOGE("dqbuf failed[0x%x]", error);
+				break;
+			}
 		}
 
 		handle->buffer_dequeued_count++;
@@ -1202,7 +1449,10 @@ static void *__camera_buffer_handler_func(gpointer data)
 
 		/* check capture request flag */
 		if (handle->capture_request) {
-			__camera_do_capture(handle);
+			if (handle->camss)
+				__camss_do_capture(handle);
+			else
+				__camera_do_capture(handle);
 			handle->capture_request = FALSE;
 		}
 
@@ -1494,6 +1744,23 @@ int camera_v4l2_open_device(void *camera_handle, int device_index)
 
 	node_path = g_device_info_list->device_info[device_index].node_path;
 
+	if (device_index == g_camss_index) {
+		handle->camss = camss_open(&ret);
+		if (!handle->camss) {
+			LOGE("camss open failed 0x%x", ret);
+			goto _OPEN_DEVICE_DONE;
+		}
+
+		handle->buffer_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		handle->memory_type = V4L2_MEMORY_MMAP;
+		handle->state = CAMERA_STATE_OPENED;
+		handle->device_index = device_index;
+		handle->device_fd = camss_get_fd(handle->camss);
+
+		LOGD("[%d] camss device opened [fd %d]", device_index, handle->device_fd);
+		goto _OPEN_DEVICE_DONE;
+	}
+
 	device_fd = open(node_path, O_RDWR);
 	if (device_fd < 0) {
 		switch (errno) {
@@ -1576,7 +1843,13 @@ int camera_v4l2_close_device(void *camera_handle)
 		return CAMERA_ERROR_INVALID_STATE;
 	}
 
-	if (handle->device_fd >= 0) {
+	if (handle->camss) {
+		LOGD("close camss device");
+
+		camss_close(handle->camss);
+		handle->camss = NULL;
+		handle->device_fd = CAMERA_HAL_INITIAL_FD;
+	} else if (handle->device_fd >= 0) {
 		LOGD("close fd %d", handle->device_fd);
 
 		v4l2_close(handle->device_fd);
@@ -1887,9 +2160,22 @@ int camera_v4l2_release_preview_buffer(void *camera_handle, int index)
 		return CAMERA_ERROR_INVALID_PARAMETER;
 	}
 
-	if (index >= handle->buffer_count) {
+	if (index < 0 || index >= handle->buffer_count) {
 		LOGE("invalid buffer index %d", index);
 		return CAMERA_ERROR_INVALID_PARAMETER;
+	}
+
+	if (handle->camss) {
+		g_mutex_lock(&handle->buffer_lock);
+
+		handle->camss_busy[index] = FALSE;
+		if (handle->buffer_dequeued_count > 0)
+			handle->buffer_dequeued_count--;
+
+		g_cond_signal(&handle->buffer_cond);
+		g_mutex_unlock(&handle->buffer_lock);
+
+		return CAMERA_ERROR_NONE;
 	}
 
 	ret = __camera_v4l2_qbuf(handle->device_fd,

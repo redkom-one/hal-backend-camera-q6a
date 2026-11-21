@@ -7,9 +7,9 @@
 %endif
 
 Name:       hal-backend-camera-v4l2
-Summary:    Tizen Camera Hal using generic V4L2 interface
+Summary:    Tizen Camera Hal using generic V4L2 interface (+ Qualcomm camss raw sensors)
 Version:    0.0.3
-Release:    0
+Release:    0.q6a1
 Group:      Multimedia/Libraries
 License:    Apache-2.0
 Source0:    %{name}-%{version}.tar.gz
