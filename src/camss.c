@@ -25,12 +25,25 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 #include <linux/media.h>
-#include <linux/media-bus-format.h>
 #include <linux/v4l2-subdev.h>
 #include <linux/videodev2.h>
 #include <dlog.h>
 
 #include "camss.h"
+
+/* Tizen 7.0's kernel headers predate linux/media-bus-format.h */
+#ifndef MEDIA_BUS_FMT_SBGGR10_1X10
+#define MEDIA_BUS_FMT_SBGGR10_1X10	0x3007
+#define MEDIA_BUS_FMT_SGBRG10_1X10	0x300e
+#define MEDIA_BUS_FMT_SGRBG10_1X10	0x300a
+#define MEDIA_BUS_FMT_SRGGB10_1X10	0x300f
+#endif
+#ifndef V4L2_PIX_FMT_SRGGB10P
+#define V4L2_PIX_FMT_SBGGR10P	v4l2_fourcc('p', 'B', 'A', 'A')
+#define V4L2_PIX_FMT_SGBRG10P	v4l2_fourcc('p', 'G', 'A', 'A')
+#define V4L2_PIX_FMT_SGRBG10P	v4l2_fourcc('p', 'g', 'A', 'A')
+#define V4L2_PIX_FMT_SRGGB10P	v4l2_fourcc('p', 'R', 'A', 'A')
+#endif
 
 #ifdef LOG_TAG
 #undef LOG_TAG
